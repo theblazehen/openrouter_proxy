@@ -2,7 +2,6 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 import asyncio
 import time
 import json
@@ -223,9 +222,6 @@ key_manager = KeyManager(API_KEYS)  # Initialize key manager with API keys
 http_client = httpx.AsyncClient(
     timeout=None,  # Global timeout for the client
 )
-
-# Configure static files serving
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 # --- Helper Functions ---
