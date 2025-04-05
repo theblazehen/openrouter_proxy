@@ -8,6 +8,8 @@ dependencies = [
     "uvicorn[standard]",
     "httpx",
     "jinja2>=3.1.6",
+    "pydantic-settings>=2.8.1",
+    "redis>=5.2.1",
 ]
 
 [build-system]
