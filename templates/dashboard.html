@@ -3,7 +3,6 @@
 
 <head>
     <title>API Key Dashboard</title>
-    <meta http-equiv="refresh" content="15">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {
@@ -314,13 +313,12 @@
             { borderColor: '#e74a3b', backgroundColor: 'rgba(231, 74, 59, 0.4)' },  // Red
             { borderColor: '#36b9cc', backgroundColor: 'rgba(54, 185, 204, 0.4)' }, // Cyan
             { borderColor: '#6f42c1', backgroundColor: 'rgba(111, 66, 193, 0.4)' }  // Purple
+
         ];
-// Do the initial update - data is already in the page from server render
-updateDashboard();
-
-
-        // Update every 15 seconds
+        // Do the initial update - data is already in the page from server render
         updateDashboard();
+
+
         setInterval(updateDashboard, 15000);
     </script>
 </body>
