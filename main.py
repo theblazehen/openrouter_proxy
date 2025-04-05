@@ -349,72 +349,69 @@ class KeyManager:
             )
 
     async def get_usable_key(self) -> str:
-        async def get_usable_key(self) -> str:
-            """
-            Finds a usable key based on both cooldown status and available requests in the 24h window.
-            Keys are sorted by:
-            1. Not in cooldown
-            2. Most available requests in 24h window
-            3. Least recently used (as tie-breaker)
-            """
-            while True:
-                # Filter enabled keys
-                valid_keys = [k for k in self.keys.values() if k.enabled]
-                now = time.time()
+        """
+        Finds a usable key based on both cooldown status and available requests in the 24h window.
+        Keys are sorted by:
+        1. Not in cooldown
+        2. Most available requests in 24h window
+        3. Least recently used (as tie-breaker)
+        """
+        while True:
+            # Filter enabled keys
+            valid_keys = [k for k in self.keys.values() if k.enabled]
+            now = time.time()
 
-                # Sort keys considering both cooldown and available requests
-                sorted_keys = sorted(
-                    valid_keys,
-                    key=lambda k: (
-                        now
-                        < k.rate_limited_until,  # Cooldown keys last (True sorts after False)
-                        -k.get_available_requests(
-                            self.settings.rpd_limit
-                        ),  # Most available requests first (negative for descending)
-                        k.last_used_time,  # Least recently used first
-                    ),
+            # Sort keys considering both cooldown and available requests
+            sorted_keys = sorted(
+                valid_keys,
+                key=lambda k: (
+                    now
+                    < k.rate_limited_until,  # Cooldown keys last (True sorts after False)
+                    -k.get_available_requests(
+                        self.settings.rpd_limit
+                    ),  # Most available requests first (negative for descending)
+                    k.last_used_time,  # Least recently used first
+                ),
+            )
+
+            if not sorted_keys:
+                logger.error("No API keys available for the request.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="No API keys available.",
                 )
 
-                if not sorted_keys:
-                    logger.error("No API keys available for the request.")
-                    raise HTTPException(
-                        status_code=503,
-                        detail="No API keys available.",
-                    )
-
-                selected_key_info = None
-                # Check keys in sorted order
-                for key_info in sorted_keys:
-                    # Check cooldown status
-                    is_limited = await key_info.is_rate_limited(self.redis_client)
-                    if not is_limited:
-                        # Check available requests
-                        available = key_info.get_available_requests(
-                            self.settings.rpd_limit
+            selected_key_info = None
+            # Check keys in sorted order
+            for key_info in sorted_keys:
+                # Check cooldown status
+                is_limited = await key_info.is_rate_limited(self.redis_client)
+                if not is_limited:
+                    # Check available requests
+                    available = key_info.get_available_requests(self.settings.rpd_limit)
+                    if available > 1:  # Keep at least 1 request as buffer
+                        selected_key_info = key_info
+                        break
+                    else:
+                        logger.debug(
+                            f"Key ...{key_info.key[-4:]} has insufficient available requests ({available})"
                         )
-                        if available > 1:  # Keep at least 1 request as buffer
-                            selected_key_info = key_info
-                            break
-                        else:
-                            logger.debug(
-                                f"Key ...{key_info.key[-4:]} has insufficient available requests ({available})"
-                            )
 
-                if selected_key_info:
-                    await selected_key_info.record_usage(self.redis_client)
-                    logger.debug(
-                        f"Selected key ...{selected_key_info.key[-4:]} (total: {selected_key_info.total_requests}, "
-                        f"available: {selected_key_info.get_available_requests(self.settings.rpd_limit)}, "
-                        f"last used: {time.ctime(selected_key_info.last_used_time)})"
-                    )
-                    return selected_key_info.key
-
-                # All keys are either rate-limited or have insufficient available requests
-                logger.warning(
-                    f"All {len(valid_keys)} enabled keys are currently unavailable (cooldown or insufficient requests). "
-                    f"Waiting {self.settings.retry_delay_seconds}s..."
+            if selected_key_info:
+                await selected_key_info.record_usage(self.redis_client)
+                logger.debug(
+                    f"Selected key ...{selected_key_info.key[-4:]} (total: {selected_key_info.total_requests}, "
+                    f"available: {selected_key_info.get_available_requests(self.settings.rpd_limit)}, "
+                    f"last used: {time.ctime(selected_key_info.last_used_time)})"
                 )
-                await asyncio.sleep(self.settings.retry_delay_seconds)
+                return selected_key_info.key
+
+            # All keys are either rate-limited or have insufficient available requests
+            logger.warning(
+                f"All {len(valid_keys)} enabled keys are currently unavailable (cooldown or insufficient requests). "
+                f"Waiting {self.settings.retry_delay_seconds}s..."
+            )
+            await asyncio.sleep(self.settings.retry_delay_seconds)
 
     async def update_key_state(
         self,
@@ -832,8 +829,14 @@ async def proxy_openrouter(request: Request, path: str):
 
     logger.debug(f"Target URL: {target_url}")
 
+    # Safer logging with check for None
+    key_suffix = (
+        f"...{selected_key[-4:]}"
+        if selected_key and len(selected_key) >= 4
+        else "UNKNOWN"
+    )
     logger.info(
-        f"Forwarding {request.method} request to {target_url} using key ending in ...{selected_key[-4:]}"
+        f"Forwarding {request.method} request to {target_url} using key ending in {key_suffix}"
     )
 
     return await _forward_request(request, target_url, selected_key)
