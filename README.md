@@ -9,6 +9,7 @@ A FastAPI-based reverse proxy for the [OpenRouter API](https://openrouter.ai/doc
 - **Dashboard**: Visual monitoring of API key usage and availability
 - **API Endpoint Compatibility**: Direct drop-in replacement for OpenRouter API endpoints
 - **Streaming Support**: Full streaming support for chat completions
+- **Redis Persistence**: Optional Redis-based persistence for key states and usage metrics
 
 ## Requirements
 
@@ -51,6 +52,7 @@ The proxy is configured using environment variables. You can set these directly 
 | `HOST` | Host to bind the server to | IP address | 0.0.0.0 | No |
 | `PORT` | Port to run the server on | Integer | 8000 | No |
 | `LOG_LEVEL` | Logging level | debug, info, warning, error, critical | info | No |
+| `REDIS_URL` | Redis connection URL for persistence | URL | None | No |
 
 ### Example Configuration
 
@@ -163,6 +165,7 @@ When deploying this proxy to production, consider the following:
 | Dashboard not updating | Check the browser console for errors, ensure the proxy is running |
 | Rate limiting errors | One or more API keys may be at their limits, add more keys |
 | High memory usage | Check for memory leaks, reduce historical tracking |
+| Redis connection failed | Check Redis URL format and server availability |
 
 ### Debugging
 

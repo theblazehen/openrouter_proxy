@@ -4,7 +4,7 @@
 <head>
     <title>API Key Dashboard</title>
     <meta http-equiv="refresh" content="15">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -16,6 +16,50 @@
             color: #2c3e50;
             border-bottom: 2px solid #eee;
             padding-bottom: 0.5rem;
+        }
+
+        .summary-stats {
+            display: flex;
+            justify-content: center;
+            margin: 2rem 0;
+        }
+
+        .stat-box {
+            background: white;
+            padding: 1.5rem 3rem;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            text-align: center;
+        }
+
+        .stat-title {
+            font-size: 1.1rem;
+            color: #2c3e50;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin: 0.5rem 0;
+        }
+
+        .stat-value .available {
+            color: #28a745;
+        }
+
+        .stat-value .separator {
+            color: #6c757d;
+            margin: 0 0.5rem;
+        }
+
+        .stat-value .total {
+            color: #6c757d;
+        }
+
+        .stat-subtitle {
+            font-size: 0.9rem;
+            color: #6c757d;
         }
 
         table {
@@ -44,12 +88,8 @@
             background-color: #f8f9fa;
         }
 
-        .near-limit {
+        .cooling-down {
             background-color: #fff3cd;
-        }
-
-        .over-limit {
-            background-color: #f8d7da;
         }
 
         .status-enabled {
@@ -62,60 +102,40 @@
             font-weight: 500;
         }
 
-        .usage-cell {
-            font-weight: bold;
-        }
-
-        .usage-high {
-            color: #dc3545;
-        }
-
-        .usage-medium {
-            color: #ffc107;
-        }
-
         .chart-container {
-            display: flex;
-            justify-content: space-between;
-            margin-top: 2rem;
-            gap: 2rem;
-        }
-
-        .chart-box {
-            flex: 1;
+            width: 100%;
+            height: 400px;
+            margin: 2rem 0;
+            padding: 1rem;
             background: white;
-            padding: 1rem;
             border-radius: 8px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-
-        canvas {
-            width: 100% !important;
-            height: 450px !important;
-        }
-
-        .stats-summary {
-            font-size: 1.2rem;
-            margin-bottom: 1rem;
-            background: #f8f9fa;
-            padding: 1rem;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-        }
-
-        .available-count {
-            font-weight: bold;
-            color: #28a745;
+            margin-bottom: 0;  /* Remove bottom margin since it's last */
         }
     </style>
 </head>
 
 <body>
-    <h1>API Key Dashboard - Daily Completion Limits</h1>
-    <div class="stats-summary">
-        <strong>Total Available Completions:</strong> <span class="available-count">{{ total_available_completions
-            }}</span>
+    <h1>API Key Dashboard - Status & Availability</h1>
+
+    <div class="summary-stats">
+        <div class="stat-box">
+            <div class="stat-title">Available Free Requests</div>
+            <div class="stat-value">
+                {% set total_available = namespace(value=0) %}
+                {% for row in stats %}
+                    {% if row.enabled and not row.is_limited %}
+                        {% set total_available.value = total_available.value + row.available_requests %}
+                    {% endif %}
+                {% endfor %}
+                <span class="available">{{ total_available.value }}</span>
+                <span class="separator">/</span>
+                <span class="total">{{ rpd_limit * stats|length }}</span>
+            </div>
+            <div class="stat-subtitle">Current / Maximum Daily Requests</div>
+        </div>
     </div>
+
     <table>
         <thead>
             <tr>
@@ -123,35 +143,42 @@
                 <th>Key</th>
                 <th>Status</th>
                 <th>Total Reqs</th>
-                <th>Completions</th>
+                <th>Available</th>
+                <th>Cooldown Until</th>
+                <th>Last Used</th>
             </tr>
         </thead>
         <tbody>
             {% for row in stats %}
             <tr
-                class="{% if row.daily_usage >= rpd_limit %}over-limit{% elif row.daily_usage >= rpd_limit * 0.9 %}near-limit{% endif %}">
+                class="{% if not row.enabled %}status-disabled{% elif row.is_limited %}cooling-down{% endif %}">
                 <td>{{ row.name }}</td>
                 <td>...{{ row.key_suffix }}</td>
                 <td class="status-{{ 'enabled' if row.enabled else 'disabled' }}">
-                    {{ '✓ Enabled' if row.enabled else '✗ Disabled' }}
+                    {% if not row.enabled %}
+                        ✗ Disabled
+                    {% elif row.is_limited %}
+                        ⏳ Cooling ({{ "%.1f"|format(row.cooldown_remaining_seconds / 3600) }}h)
+                    {% else %}
+                        ✓ Enabled
+                    {% endif %}
                 </td>
                 <td>{{ row.total_requests }}</td>
-                <td
-                    class="usage-cell {% if row.daily_usage >= rpd_limit %}usage-high{% elif row.daily_usage >= rpd_limit * 0.9 %}usage-medium{% endif %}">
-                    {{ row.daily_usage }}/{{ rpd_limit }}
-                </td>
+                <td>{{ row.available_requests }}</td>
+                <td>{{ row.rate_limited_until_str }}</td>
+                <td>{{ row.last_used_str }}</td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
 
     <div class="chart-container">
-        <div class="chart-box" style="width: 100%;">
-            <canvas id="availabilityChart"></canvas>
-        </div>
+        <canvas id="availabilityChart"></canvas>
     </div>
 
     <script>
+        let chart = null;
+
         // Helper function to format time
         function formatTime(hours) {
             if (hours === 0) return 'now';
@@ -160,44 +187,124 @@
             return `${Math.floor(hours / 24)} days`;
         }
 
-        // Get data from stats
-        const stats = {{ stats_json | safe }};
-        const RPD_LIMIT = {{ rpd_limit }};
-        const currentTime = Date.now() / 1000;
-        const dayAgo = currentTime - 86400;
+        function updateDashboard() {
+            fetch('/api/stats')
+                .then(response => response.json())
+                .then(data => {
+                    // Update summary stats
+                    const totalAvailable = data.stats.reduce((sum, row) => {
+                        if (row.enabled && !row.is_limited) {
+                            return sum + row.available_requests;
+                        }
+                        return sum;
+                    }, 0);
 
-        // Free Request Availability Prediction Chart - using actual timestamp data
-        const availCtx = document.getElementById('availabilityChart').getContext('2d');
+                    document.querySelector('.stat-value .available').textContent = totalAvailable;
+                    document.querySelector('.stat-value .total').textContent = data.rpd_limit * data.stats.length;
 
-        // Generate time points from -24h to +24h, every hour
-        const hourPoints = Array.from({ length: 49 }, (_, i) => i - 24);
+                    // Update table
+                    const tbody = document.querySelector('tbody');
+                    tbody.innerHTML = '';
+                    data.stats.forEach(row => {
+                        const tr = document.createElement('tr');
+                        tr.className = !row.enabled ? 'status-disabled' : row.is_limited ? 'cooling-down' : '';
 
-        const predictions = stats.map(s => {
-            // Use the actual timestamp data from the key's daily_requests
-            return hourPoints.map(h => {
-                const pointInTime = currentTime + (h * 3600);
-                const window24hStart = pointInTime - 86400;
+                        tr.innerHTML = `
+                            <td>${row.name}</td>
+                            <td>...${row.key_suffix}</td>
+                            <td class="status-${row.enabled ? 'enabled' : 'disabled'}">
+                                ${!row.enabled ? '✗ Disabled' :
+                                  row.is_limited ? `⏳ Cooling (${(row.cooldown_remaining_seconds / 3600).toFixed(1)}h)` :
+                                  '✓ Enabled'}
+                            </td>
+                            <td>${row.total_requests}</td>
+                            <td>${row.available_requests}</td>
+                            <td>${row.rate_limited_until_str}</td>
+                            <td>${row.last_used_str}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
 
-                // Count how many requests are within the 24h window at this point in time
-                // For past points (h < 0): use actual historical data up to that point
-                // For future points (h >= 0): use current data and project expiration
-                const requestsInWindow = s.timestamps.filter(timestamp => {
-                    if (h < 0) {
-                        // For past points, only count timestamps that were before this point
-                        // and within its 24h window
-                        return timestamp <= pointInTime && timestamp > window24hStart;
+                    // Update chart
+                    const currentTime = Date.now() / 1000;
+                    const hourPoints = Array.from({ length: 49 }, (_, i) => i - 24);
+
+                    const predictions = data.stats.map(s => {
+                        return hourPoints.map(h => {
+                            const pointInTime = currentTime + (h * 3600);
+                            const window24hStart = pointInTime - 86400;
+
+                            const requestsInWindow = s.timestamps.filter(timestamp => {
+                                if (h < 0) {
+                                    return timestamp <= pointInTime && timestamp > window24hStart;
+                                } else {
+                                    return timestamp <= currentTime && timestamp > window24hStart;
+                                }
+                            }).length;
+
+                            return Math.max(1, data.rpd_limit - requestsInWindow);
+                        });
+                    });
+
+                    if (chart) {
+                        chart.data.datasets = data.stats.map((s, i) => ({
+                            label: s.name,
+                            data: predictions[i],
+                            borderColor: apiColors[i % apiColors.length].borderColor,
+                            backgroundColor: apiColors[i % apiColors.length].backgroundColor,
+                            fill: true,
+                            tension: 0.4
+                        }));
+                        chart.options.scales.y.max = data.rpd_limit * data.stats.length;
+                        chart.update('none'); // Update without animation
                     } else {
-                        // For future points, only count timestamps that are in the current data
-                        // and will still be within the sliding 24h window at this future time
-                        return timestamp <= currentTime && timestamp > window24hStart;
+                        const availCtx = document.getElementById('availabilityChart').getContext('2d');
+                        chart = new Chart(availCtx, {
+                            type: 'line',
+                            data: {
+                                labels: hourPoints.map(h => h < 0 ? `${-h}h ago` : formatTime(h)),
+                                datasets: data.stats.map((s, i) => ({
+                                    label: s.name,
+                                    data: predictions[i],
+                                    borderColor: apiColors[i % apiColors.length].borderColor,
+                                    backgroundColor: apiColors[i % apiColors.length].backgroundColor,
+                                    fill: true,
+                                    tension: 0.4
+                                }))
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                animation: false,
+                                plugins: {
+                                    title: {
+                                        display: true,
+                                        text: 'Free Request Availability (Past & Predicted)',
+                                        font: { size: 16 }
+                                    },
+                                    legend: {
+                                        position: 'top',
+                                        labels: { font: { size: 14 } }
+                                    }
+                                },
+                                scales: {
+                                    y: {
+                                        min: 0,
+                                        max: data.rpd_limit * data.stats.length,
+                                        title: {
+                                            display: true,
+                                            text: 'Available Free Requests'
+                                        },
+                                        stacked: true
+                                    },
+                                    x: { stacked: true }
+                                }
+                            }
+                        });
                     }
-                }).length;
-
-                // Available free requests = Max free requests (RPD_LIMIT) - requests in the 24h window
-                // Minimum available is 1 (to prevent drops to 0)
-                return Math.max(1, RPD_LIMIT - requestsInWindow);
-            });
-        });
+                })
+                .catch(error => console.error('Error updating dashboard:', error));
+        }
 
         // Define unique colors for each API key
         const apiColors = [
@@ -208,57 +315,13 @@
             { borderColor: '#36b9cc', backgroundColor: 'rgba(54, 185, 204, 0.4)' }, // Cyan
             { borderColor: '#6f42c1', backgroundColor: 'rgba(111, 66, 193, 0.4)' }  // Purple
         ];
+// Do the initial update - data is already in the page from server render
+updateDashboard();
 
-        new Chart(availCtx, {
-            type: 'line',
-            data: {
-                labels: hourPoints.map(h => h < 0 ? `${-h}h ago` : formatTime(h)),
-                datasets: stats.map((s, i) => ({
-                    label: s.name,
-                    data: predictions[i],
-                    borderColor: apiColors[i % apiColors.length].borderColor,
-                    backgroundColor: apiColors[i % apiColors.length].backgroundColor,
-                    fill: true,
-                    tension: 0.4
-                }))
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: false,  // Disable animations
-                plugins: {
-                    title: {
-                        display: true,
-                        text: 'Free Request Availability (Past & Predicted)',
-                        font: {
-                            size: 16
-                        }
-                    },
-                    legend: {
-                        position: 'top',
-                        labels: {
-                            font: {
-                                size: 14
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    y: {
-                        min: 0,
-                        max: RPD_LIMIT * stats.length, // Multiply by number of API keys since we're stacking
-                        title: {
-                            display: true,
-                            text: 'Available Free Requests'
-                        },
-                        stacked: true
-                    },
-                    x: {
-                        stacked: true
-                    }
-                }
-            }
-        });
+
+        // Update every 15 seconds
+        updateDashboard();
+        setInterval(updateDashboard, 15000);
     </script>
 </body>
 
