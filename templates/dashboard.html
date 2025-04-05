@@ -163,7 +163,7 @@
                     {% endif %}
                 </td>
                 <td>{{ row.total_requests }}</td>
-                <td>{{ row.available_requests }}</td>
+                <td>{% if row.is_limited %}???{% else %}{{ row.available_requests }}{% endif %}</td>
                 <td>{{ row.rate_limited_until_str }}</td>
                 <td>{{ row.last_used_str }}</td>
             </tr>
@@ -217,7 +217,7 @@
                                   '✓ Enabled'}
                             </td>
                             <td>${row.total_requests}</td>
-                            <td>${row.available_requests}</td>
+                            <td>${row.is_limited ? '???' : row.available_requests}</td>
                             <td>${row.rate_limited_until_str}</td>
                             <td>${row.last_used_str}</td>
                         `;
@@ -229,18 +229,29 @@
                     const hourPoints = Array.from({ length: 49 }, (_, i) => i - 24);
 
                     const predictions = data.stats.map(s => {
+                        // Fetch rate_limited_until from the full stats data if needed
+                        const fullStat = data.stats.find(stat => stat.name === s.name);
+                        const rateLimitedUntil = fullStat ? fullStat.rate_limited_until : 0; // Get cooldown end time
+
                         return hourPoints.map(h => {
                             const pointInTime = currentTime + (h * 3600);
+
+                            // Check if cooling and point is within cooldown period
+                            if (h >= 0 && s.is_limited && pointInTime < rateLimitedUntil) {
+                                return null; // Show gap during cooldown
+                            }
+
                             const window24hStart = pointInTime - 86400;
 
+                            // Calculate requests in the 24h window ending at pointInTime
+                            // For future points (h >= 0), only consider requests up to 'now' (currentTime)
+                            // For past points (h < 0), consider requests up to 'pointInTime'
+                            const effectiveEndTime = h < 0 ? pointInTime : currentTime;
                             const requestsInWindow = s.timestamps.filter(timestamp => {
-                                if (h < 0) {
-                                    return timestamp <= pointInTime && timestamp > window24hStart;
-                                } else {
-                                    return timestamp <= currentTime && timestamp > window24hStart;
-                                }
+                                return timestamp <= effectiveEndTime && timestamp > window24hStart;
                             }).length;
 
+                            // Calculate predicted availability
                             return Math.max(1, data.rpd_limit - requestsInWindow);
                         });
                     });
