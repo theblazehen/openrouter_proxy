@@ -57,7 +57,18 @@ class Settings(BaseSettings):
     redis_url: str | None = Field(None, validation_alias="REDIS_URL")
     host: str = Field("0.0.0.0", validation_alias="HOST")
     port: int = Field(8000, validation_alias="PORT")
-    workers: int = Field(4, validation_alias="WORKERS")
+    workers: int = Field(1, validation_alias="WORKERS")
+
+    # Retry settings for error prefixes in 200 OK responses
+    retry_error_prefixes: List[str] = Field(
+        default=['{"error":{"message":"Provider returned error","code":429'],
+        validation_alias="RETRY_ERROR_PREFIXES",
+    )
+    retry_buffer_size: int = Field(128, validation_alias="RETRY_BUFFER_SIZE")
+    max_retries_on_prefix: int = Field(59, validation_alias="MAX_RETRIES_ON_PREFIX")
+    retry_on_prefix_delay_seconds: float = Field(
+        1.0, validation_alias="RETRY_ON_PREFIX_DELAY_SECONDS"
+    )
 
     class Config:
         env_file = ".env"
@@ -85,6 +96,14 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("proxy.log")],
 )
 logger = logging.getLogger(__name__)
+
+
+class RetryWithErrorPrefixException(Exception):
+    """Exception raised when a response contains an error prefix that should trigger a retry."""
+
+    def __init__(self, prefix):
+        self.prefix = prefix
+        super().__init__(f"Response contains error prefix: {prefix}")
 
 
 # --- API Key Parsing ---
@@ -483,10 +502,12 @@ http_client = httpx.AsyncClient(timeout=None)
 
 
 # --- Helper Functions ---
-async def _forward_request(request: Request, target_url: str, api_key: str):
+async def _forward_request(
+    request: Request, target_url: str, api_key: str, body: bytes
+):
     """Forwards the incoming request to the target URL with the given API key."""
     headers = dict(request.headers)
-    headers.pop("host")
+    headers.pop("host", None)
     headers.pop("authorization", None)
     # Required headers for OpenRouter API (https://openrouter.ai/docs)
     headers.update(
@@ -504,7 +525,14 @@ async def _forward_request(request: Request, target_url: str, api_key: str):
     # Log headers without sensitive information
     safe_headers = {k: v for k, v in headers.items() if "auth" not in k.lower()}
     logger.debug(f"Request headers: {safe_headers}")
-    content = await request.body()
+
+    # Use the body provided as a parameter instead of reading it again
+    content = body
+
+    # Convert retry_error_prefixes to bytes for comparison
+    retry_error_prefixes_bytes = [
+        prefix.encode() for prefix in settings.retry_error_prefixes
+    ]
 
     try:
         req = http_client.build_request(
@@ -534,18 +562,55 @@ async def _forward_request(request: Request, target_url: str, api_key: str):
         else:
             response.raise_for_status()  # Raise for other 4xx/5xx errors
 
+        # For 200 OK responses, buffer initial data to check for retry error prefixes
+        if response.status_code == 200:
+            # Buffer for detecting error prefixes
+            buffer_size = settings.retry_buffer_size
+            buffer = b""
+
+            # Create an iterator from the response
+            response_iter = response.aiter_bytes()
+
+            # Read up to buffer_size bytes (or less if the response is smaller)
+            try:
+                for _ in range(buffer_size):
+                    try:
+                        chunk = await anext(response_iter)
+                        buffer += chunk
+
+                        # Check if buffer contains any error prefix (might have newlines before the error)
+                        for prefix_bytes in retry_error_prefixes_bytes:
+                            if prefix_bytes in buffer:
+                                logger.warning(
+                                    f"Detected error prefix in stream with 200 OK: {prefix_bytes.decode(errors='ignore')}"
+                                )
+                                raise RetryWithErrorPrefixException(
+                                    prefix_bytes.decode(errors="ignore")
+                                )
+                    except StopAsyncIteration:
+                        # End of response reached before buffer filled
+                        break
+            except RetryWithErrorPrefixException:
+                # Let this propagate up to the calling function
+                raise
+
         # Store headers before streaming starts
         response_headers = dict(response.headers)
 
         # Create an async generator to check for RPD limit while streaming
         async def check_rpd_stream():
-            buffer = b""
-            max_buffer_size = 16384  # 16KB max buffer size
-            async for chunk in response.aiter_bytes():
-                buffer += chunk
+            # First yield our already-read buffer
+            if buffer:
+                yield buffer
+
+            # Now continue with the rest of the response
+            buffer_for_rpd = b""
+            max_buffer_size = 128
+            async for chunk in response_iter:
+                buffer_for_rpd += chunk
                 # Try to decode and check for RPD limit in accumulated buffer
                 try:
-                    text = buffer.decode(
+                    text = buffer_for_rpd.decode(
                         errors="ignore"
                     )  # Ignore decode errors for partial data
                     # Check if any RPD limit pattern is in the decoded text
@@ -561,15 +626,15 @@ async def _forward_request(request: Request, target_url: str, api_key: str):
                             )
                             # No need to raise an error here, let the stream continue but mark the key
                         # Clear buffer after match
-                        buffer = b""
-                    elif len(buffer) > max_buffer_size:
+                        buffer_for_rpd = b""
+                    elif len(buffer_for_rpd) > max_buffer_size:
                         # Keep last 1KB in case pattern spans chunks
-                        buffer = buffer[-1024:]
+                        buffer_for_rpd = buffer_for_rpd[-1024:]
                 except UnicodeDecodeError:
                     # If we can't decode yet, continue accumulating
-                    if len(buffer) > max_buffer_size:
+                    if len(buffer_for_rpd) > max_buffer_size:
                         # Keep last 1KB even if decode fails
-                        buffer = buffer[-1024:]
+                        buffer_for_rpd = buffer_for_rpd[-1024:]
                 yield chunk
 
         # Stream the response back with RPD checking
@@ -579,6 +644,41 @@ async def _forward_request(request: Request, target_url: str, api_key: str):
             headers=response_headers,
             media_type=response.headers.get("content-type"),
         )
+
+    except RetryWithErrorPrefixException as e:
+        # Close the response to ensure resources are released
+        await response.aclose()
+
+        # Log the error prefix detection
+        logger.warning(
+            f"Detected error prefix '{e.prefix}' in 200 OK response. This response will be retried."
+        )
+
+        # Register a "hit" for rate limiting but don't apply cooldown
+        key_info = key_manager.keys.get(api_key)
+        if key_info:
+            # Only record usage, don't set rate_limited_until
+            async with key_info.lock:
+                key_info.total_requests += 1
+                now = time.time()
+                key_info.timestamps.append(now)
+                key_info.prune_old_timestamps(now - 86400)
+
+                if key_manager.redis_client:
+                    # Use pipeline for atomic updates
+                    async with key_manager.redis_client.pipeline(
+                        transaction=True
+                    ) as pipe:
+                        pipe.hincrby(f"keyinfo:{api_key}", "total_requests", 1)
+                        pipe.hset(
+                            f"keyinfo:{api_key}",
+                            "timestamps",
+                            ",".join(map(str, key_info.timestamps)),
+                        )
+                        await pipe.execute()
+
+        # Raise the exception to be handled by the caller
+        raise
 
     except httpx.HTTPStatusError as e:
         # Log the status code from the error response
@@ -777,6 +877,7 @@ async def proxy_openrouter(request: Request, path: str):
     Catch-all route to proxy requests to the OpenRouter API.
     Selects a least recently used key that is not rate-limited.
     Applies cooldown if rate limit errors occur.
+    Implements retry mechanism for streaming errors.
     """
     # Read and validate the request body
     body = await request.body()
@@ -810,36 +911,73 @@ async def proxy_openrouter(request: Request, path: str):
                 detail="Invalid JSON in request body",
             )
 
-    # is_completion = "chat/completion" in path # No longer needed for tracking
-    try:
-        # Get a key that is enabled and not in cooldown
-        selected_key = await key_manager.get_usable_key()
-        # Usage is recorded within get_usable_key now
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions
-    except Exception as e:
-        logger.critical(f"Failed to get a usable API key: {e}")
-        raise HTTPException(
-            status_code=503, detail="Service Unavailable: No API keys available."
-        )
-
     target_url = f"{settings.openrouter_api_base}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
     logger.debug(f"Target URL: {target_url}")
 
-    # Safer logging with check for None
-    key_suffix = (
-        f"...{selected_key[-4:]}"
-        if selected_key and len(selected_key) >= 4
-        else "UNKNOWN"
-    )
-    logger.info(
-        f"Forwarding {request.method} request to {target_url} using key ending in {key_suffix}"
-    )
+    # Setup retry variables
+    max_retries = settings.max_retries_on_prefix
+    retry_count = 0
+    retry_delay = settings.retry_on_prefix_delay_seconds
 
-    return await _forward_request(request, target_url, selected_key)
+    while True:
+        try:
+            # Get a key that is enabled and not in cooldown
+            selected_key = await key_manager.get_usable_key()
+            # Usage is recorded within get_usable_key now
+
+            # Safer logging with check for None
+            key_suffix = (
+                f"...{selected_key[-4:]}"
+                if selected_key and len(selected_key) >= 4
+                else "UNKNOWN"
+            )
+
+            # If we're retrying, log it with more information
+            if retry_count > 0:
+                logger.info(
+                    f"Retry {retry_count}/{max_retries}: Forwarding request to {target_url} using key ending in {key_suffix}"
+                )
+            else:
+                logger.info(
+                    f"Forwarding {request.method} request to {target_url} using key ending in {key_suffix}"
+                )
+
+            # Forward the request with the body we already read
+            return await _forward_request(request, target_url, selected_key, body)
+
+        except RetryWithErrorPrefixException as e:
+            retry_count += 1
+
+            # Check if we've exceeded the retry limit
+            if retry_count > max_retries:
+                logger.error(
+                    f"Exceeded maximum retries ({max_retries}) for error prefix detection. Last prefix: {e.prefix}"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Upstream provider error: Maximum retry attempts exceeded",
+                )
+
+            logger.warning(
+                f"Retry {retry_count}/{max_retries}: Error prefix detected '{e.prefix}'. Waiting {retry_delay}s before retry."
+            )
+
+            # Wait before retry
+            await asyncio.sleep(retry_delay)
+
+            # Continue the loop to retry with a new key
+            continue
+
+        except HTTPException:
+            raise  # Re-raise HTTP exceptions
+        except Exception as e:
+            logger.critical(f"Failed to get a usable API key or forward request: {e}")
+            raise HTTPException(
+                status_code=503, detail=f"Service Unavailable: {str(e)}"
+            )
 
 
 # --- Lifecycle Events ---
