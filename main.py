@@ -11,7 +11,7 @@ import os
 import logging
 
 # --- Logging Setup ---
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "info").upper()
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "debug").upper()
 LOG_LEVEL_MAP = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -508,8 +508,13 @@ async def _forward_request(
     """Forwards the incoming request to the target URL with the given API key."""
     headers = dict(request.headers)
     headers.pop("host", None)
-    headers.pop("authorization", None)
+    # headers.pop("authorization", None) # Keep client auth if needed for non-free models
     # Required headers for OpenRouter API (https://openrouter.ai/docs)
+    # Remove any existing Authorization headers (case-insensitive)
+    headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+
+    # For paid model requests (client-provided key), api_key is already the correct value.
+    # For free model requests, api_key is from our pool.
     headers.update(
         {
             "Authorization": f"Bearer {api_key}",
@@ -523,8 +528,10 @@ async def _forward_request(
     headers.pop("Connection", None)
 
     # Log headers without sensitive information
+    # Log all outgoing headers, including Authorization, for debugging paid model issues
+    logger.debug(f"Outgoing headers to OpenRouter: {headers}")
     safe_headers = {k: v for k, v in headers.items() if "auth" not in k.lower()}
-    logger.debug(f"Request headers: {safe_headers}")
+    logger.debug(f"Request headers (safe): {safe_headers}")
 
     # Use the body provided as a parameter instead of reading it again
     content = body
@@ -879,104 +886,164 @@ async def proxy_openrouter(request: Request, path: str):
     Applies cooldown if rate limit errors occur.
     Implements retry mechanism for streaming errors.
     """
-    # Read and validate the request body
     body = await request.body()
+    model_name = None
+    use_proxy_keys = True  # Default to using proxy keys
+    client_key = None
+    client_auth_header = request.headers.get("authorization")
 
-    # For chat completions, ensure required fields are present
+    # Determine model type and key strategy only for chat completions
     if path == "chat/completions":
         try:
             data = json.loads(body)
-            # Log request data for debugging (excluding sensitive content)
             logger.debug("Request type: chat/completions")
 
-            # Ensure required fields
-            if "messages" not in data:
+            # Basic validation
+            if (
+                "messages" not in data
+                or not isinstance(data["messages"], list)
+                or not data["messages"]
+            ):
                 raise HTTPException(
-                    status_code=400,
-                    detail="Missing required field: messages",
-                )
-            if not isinstance(data["messages"], list) or not data["messages"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Messages must be a non-empty array",
+                    status_code=400, detail="Messages must be a non-empty array"
                 )
             if "model" not in data:
                 raise HTTPException(
-                    status_code=400,
-                    detail="Missing required field: model",
+                    status_code=400, detail="Missing required field: model"
                 )
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid JSON in request body",
-            )
 
+            model_name = data.get("model", "")
+            if ":free" in model_name:
+                use_proxy_keys = True
+                logger.debug(f"Detected free model request: {model_name}")
+            else:
+                # Non-free model requires client key
+                use_proxy_keys = False
+                logger.debug(f"Detected non-free model request: {model_name}")
+                if client_auth_header and client_auth_header.lower().startswith(
+                    "bearer "
+                ):
+                    client_key = client_auth_header.split(None, 1)[1].strip()
+                    if not client_key:
+                        logger.warning(
+                            f"Empty Bearer token provided for non-free model request: {model_name}"
+                        )
+                        raise HTTPException(
+                            status_code=401,
+                            detail="Invalid Authorization header: Bearer token is empty.",
+                        )
+                    logger.info(
+                        f"Using client-provided key for non-free model {model_name}"
+                    )
+                else:
+                    logger.warning(
+                        f"Missing or invalid Authorization header for non-free model request: {model_name}"
+                    )
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Authorization header with Bearer token is required for non-free models.",
+                    )
+
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+    else:
+        # For non-chat paths, assume proxy keys should be used (original behavior)
+        logger.debug(
+            f"Request path '{path}' is not chat/completions, using proxy keys by default."
+        )
+        use_proxy_keys = True
+
+    # --- Construct Target URL ---
     target_url = f"{settings.openrouter_api_base}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
-
     logger.debug(f"Target URL: {target_url}")
 
-    # Setup retry variables
-    max_retries = settings.max_retries_on_prefix
-    retry_count = 0
-    retry_delay = settings.retry_on_prefix_delay_seconds
+    # --- Request Forwarding ---
+    if use_proxy_keys:
+        # Free model or non-chat path: Use key manager and retry logic
+        max_retries = settings.max_retries_on_prefix
+        retry_count = 0
+        retry_delay = settings.retry_on_prefix_delay_seconds
 
-    while True:
-        try:
-            # Get a key that is enabled and not in cooldown
-            selected_key = await key_manager.get_usable_key()
-            # Usage is recorded within get_usable_key now
+        while True:
+            selected_key = None  # Ensure selected_key is defined in this scope
+            try:
+                # Get a key that is enabled and not in cooldown
+                selected_key = await key_manager.get_usable_key()
+                # Usage is recorded within get_usable_key now
 
-            # Safer logging with check for None
-            key_suffix = (
-                f"...{selected_key[-4:]}"
-                if selected_key and len(selected_key) >= 4
-                else "UNKNOWN"
-            )
-
-            # If we're retrying, log it with more information
-            if retry_count > 0:
-                logger.info(
-                    f"Retry {retry_count}/{max_retries}: Forwarding request to {target_url} using key ending in {key_suffix}"
+                key_suffix = (
+                    f"...{selected_key[-4:]}"
+                    if selected_key and len(selected_key) >= 4
+                    else "UNKNOWN"
                 )
-            else:
+                log_prefix = (
+                    f"Retry {retry_count}/{max_retries}: " if retry_count > 0 else ""
+                )
                 logger.info(
-                    f"Forwarding {request.method} request to {target_url} using key ending in {key_suffix}"
+                    f"{log_prefix}Forwarding {request.method} request to {target_url} using proxy key ending in {key_suffix}"
                 )
 
-            # Forward the request with the body we already read
-            return await _forward_request(request, target_url, selected_key, body)
+                # Forward the request with the body we already read
+                return await _forward_request(request, target_url, selected_key, body)
 
-        except RetryWithErrorPrefixException as e:
-            retry_count += 1
+            except RetryWithErrorPrefixException as e:
+                retry_count += 1
+                if retry_count > max_retries:
+                    logger.error(
+                        f"Exceeded maximum retries ({max_retries}) for error prefix detection. Last prefix: {e.prefix}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Upstream provider error: Maximum retry attempts exceeded",
+                    )
+                logger.warning(
+                    f"Retry {retry_count}/{max_retries}: Error prefix detected '{e.prefix}'. Waiting {retry_delay}s before retry."
+                )
+                await asyncio.sleep(retry_delay)
+                continue  # Continue the loop to retry
 
-            # Check if we've exceeded the retry limit
-            if retry_count > max_retries:
-                logger.error(
-                    f"Exceeded maximum retries ({max_retries}) for error prefix detection. Last prefix: {e.prefix}"
+            except HTTPException:
+                raise  # Re-raise HTTP exceptions from _forward_request or key_manager
+            except Exception as e:
+                # Catch potential errors during key selection or other unexpected issues
+                logger.critical(
+                    f"Failed to get/use a proxy API key or forward request: {e}",
+                    exc_info=True,
                 )
                 raise HTTPException(
-                    status_code=500,
-                    detail=f"Upstream provider error: Maximum retry attempts exceeded",
+                    status_code=503,
+                    detail=f"Service Unavailable: Error processing request with proxy key.",
+                )
+    else:
+        # Paid model: Forward directly using client's key (already in client_key)
+        try:
+            # No retry loop here for client keys initially.
+            # If needed, specific retry logic for client keys could be added.
+            logger.info(
+                f"Forwarding {request.method} request to {target_url} using client-provided key"
+            )
+            # Ensure client_key is not None (should be guaranteed by logic above, but belt-and-suspenders)
+            if not client_key:
+                logger.error(
+                    "Internal error: client_key is None despite use_proxy_keys being False."
+                )
+                raise HTTPException(
+                    status_code=500, detail="Internal server configuration error."
                 )
 
-            logger.warning(
-                f"Retry {retry_count}/{max_retries}: Error prefix detected '{e.prefix}'. Waiting {retry_delay}s before retry."
-            )
-
-            # Wait before retry
-            await asyncio.sleep(retry_delay)
-
-            # Continue the loop to retry with a new key
-            continue
-
+            return await _forward_request(request, target_url, client_key, body)
         except HTTPException:
-            raise  # Re-raise HTTP exceptions
+            raise  # Re-raise HTTP exceptions from _forward_request
         except Exception as e:
-            logger.critical(f"Failed to get a usable API key or forward request: {e}")
+            logger.error(
+                f"Error forwarding request with client key: {e}", exc_info=True
+            )
+            # Don't expose detailed internal errors for client key issues
             raise HTTPException(
-                status_code=503, detail=f"Service Unavailable: {str(e)}"
+                status_code=502,
+                detail="Bad Gateway: Error communicating with upstream service using client key.",
             )
 
 
