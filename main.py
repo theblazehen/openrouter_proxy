@@ -31,13 +31,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@functools.cache
+import time
+from typing import Optional
+
+# In-memory async-aware cache for model free status
+_model_free_cache = {}
+_MODEL_FREE_CACHE_TTL = 3600  # seconds (1 hour)
+
+
 async def is_model_free_via_api(model_name: str) -> bool:
     """
     Enhanced free model check: If ':free' is not in the model name,
     query the OpenRouter model endpoints API and check if all pricing fields are zero.
     Returns True if the model is free, False otherwise.
+    Uses an in-memory async-aware cache with 1 hour TTL.
     """
+    now = time.time()
+    cache_entry = _model_free_cache.get(model_name)
+    if cache_entry:
+        value, timestamp = cache_entry
+        if now - timestamp < _MODEL_FREE_CACHE_TTL:
+            return value
+
     endpoint_model_name = model_name
     url = f"https://openrouter.ai/api/v1/models/{endpoint_model_name}/endpoints"
     try:
@@ -47,6 +62,7 @@ async def is_model_free_via_api(model_name: str) -> bool:
                 logger.warning(
                     f"Failed to fetch model endpoint info for {model_name}: {resp.status_code}"
                 )
+                _model_free_cache[model_name] = (False, now)
                 return False
             data = resp.json()
             endpoints = data.get("data", {}).get("endpoints", [])
@@ -54,6 +70,7 @@ async def is_model_free_via_api(model_name: str) -> bool:
                 logger.warning(
                     f"No endpoints found in OpenRouter API response for {model_name}"
                 )
+                _model_free_cache[model_name] = (False, now)
                 return False
             for ep in endpoints:
                 pricing = ep.get("pricing", {})
@@ -61,14 +78,18 @@ async def is_model_free_via_api(model_name: str) -> bool:
                 for v in pricing.values():
                     if isinstance(v, str):
                         if v.strip() != "0":
+                            _model_free_cache[model_name] = (False, now)
                             return False
                     elif isinstance(v, (int, float)):
                         if v != 0:
+                            _model_free_cache[model_name] = (False, now)
                             return False
             # All pricing fields for all endpoints are zero
+            _model_free_cache[model_name] = (True, now)
             return True
     except Exception as e:
         logger.warning(f"Error checking free status for model {model_name}: {e}")
+        _model_free_cache[model_name] = (False, now)
         return False
 
 
@@ -873,9 +894,9 @@ async def get_stats(request: Request):
 
             # Construct the row with proper spacing
             formatted_row = [
-                f"{row['name'][:widths[0]-1]:<{widths[0]}}",
+                f"{row['name'][: widths[0] - 1]:<{widths[0]}}",
                 f"...{row['key_suffix']:<{widths[1]}}",
-                f"{status_text:<{widths[2]+9}}",  # +9 for ANSI codes
+                f"{status_text:<{widths[2] + 9}}",  # +9 for ANSI codes
                 f"{row['total_requests']:<{widths[3]}}",
                 f"{row['available_requests']:<{widths[4]}}",
                 f"{cooldown_until:<{widths[5]}}",
