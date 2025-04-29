@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict
 import os
 import logging
+import re
+import functools
 
 # --- Logging Setup ---
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "debug").upper()
@@ -27,6 +29,47 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("proxy.log")],
 )
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+async def is_model_free_via_api(model_name: str) -> bool:
+    """
+    Enhanced free model check: If ':free' is not in the model name,
+    query the OpenRouter model endpoints API and check if all pricing fields are zero.
+    Returns True if the model is free, False otherwise.
+    """
+    endpoint_model_name = model_name
+    url = f"https://openrouter.ai/api/v1/models/{endpoint_model_name}/endpoints"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to fetch model endpoint info for {model_name}: {resp.status_code}"
+                )
+                return False
+            data = resp.json()
+            endpoints = data.get("data", {}).get("endpoints", [])
+            if not endpoints:
+                logger.warning(
+                    f"No endpoints found in OpenRouter API response for {model_name}"
+                )
+                return False
+            for ep in endpoints:
+                pricing = ep.get("pricing", {})
+                # If any pricing field is not "0" or 0, treat as paid
+                for v in pricing.values():
+                    if isinstance(v, str):
+                        if v.strip() != "0":
+                            return False
+                    elif isinstance(v, (int, float)):
+                        if v != 0:
+                            return False
+            # All pricing fields for all endpoints are zero
+            return True
+    except Exception as e:
+        logger.warning(f"Error checking free status for model {model_name}: {e}")
+        return False
 
 
 # --- Configuration ---
@@ -913,36 +956,44 @@ async def proxy_openrouter(request: Request, path: str):
                 )
 
             model_name = data.get("model", "")
+            use_proxy_keys = False
+            # Enhanced free model check: If ":free" not in name, check OpenRouter API for 0 pricing
             if ":free" in model_name:
                 use_proxy_keys = True
                 logger.debug(f"Detected free model request: {model_name}")
             else:
-                # Non-free model requires client key
-                use_proxy_keys = False
-                logger.debug(f"Detected non-free model request: {model_name}")
-                if client_auth_header and client_auth_header.lower().startswith(
-                    "bearer "
-                ):
-                    client_key = client_auth_header.split(None, 1)[1].strip()
-                    if not client_key:
+                # Enhanced: Check OpenRouter API for 0 pricing
+                if await is_model_free_via_api(model_name):
+                    use_proxy_keys = True
+                    logger.debug(
+                        f"Detected free model via OpenRouter API: {model_name}"
+                    )
+                else:
+                    use_proxy_keys = False
+                    logger.debug(f"Detected non-free model request: {model_name}")
+                    if client_auth_header and client_auth_header.lower().startswith(
+                        "bearer "
+                    ):
+                        client_key = client_auth_header.split(None, 1)[1].strip()
+                        if not client_key:
+                            logger.warning(
+                                f"Empty Bearer token provided for non-free model request: {model_name}"
+                            )
+                            raise HTTPException(
+                                status_code=401,
+                                detail="Invalid Authorization header: Bearer token is empty.",
+                            )
+                        logger.info(
+                            f"Using client-provided key for non-free model {model_name}"
+                        )
+                    else:
                         logger.warning(
-                            f"Empty Bearer token provided for non-free model request: {model_name}"
+                            f"Missing or invalid Authorization header for non-free model request: {model_name}"
                         )
                         raise HTTPException(
                             status_code=401,
-                            detail="Invalid Authorization header: Bearer token is empty.",
+                            detail="Authorization header with Bearer token is required for non-free models.",
                         )
-                    logger.info(
-                        f"Using client-provided key for non-free model {model_name}"
-                    )
-                else:
-                    logger.warning(
-                        f"Missing or invalid Authorization header for non-free model request: {model_name}"
-                    )
-                    raise HTTPException(
-                        status_code=401,
-                        detail="Authorization header with Bearer token is required for non-free models.",
-                    )
 
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body")
