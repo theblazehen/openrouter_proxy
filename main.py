@@ -125,7 +125,10 @@ class Settings(BaseSettings):
 
     # Retry settings for error prefixes in 200 OK responses
     retry_error_prefixes: List[str] = Field(
-        default=['{"error":{"message":"Provider returned error","code":429'],
+        default=[
+            '{"error":{"message":"Provider returned error","code":429',
+            '{"error":{"message":"Rate limit exceeded: limit_rpm/google/gemini-2.5-pro-exp-03-25',
+        ],
         validation_alias="RETRY_ERROR_PREFIXES",
     )
     retry_buffer_size: int = Field(128, validation_alias="RETRY_BUFFER_SIZE")
@@ -431,9 +434,10 @@ class KeyManager:
                 "No existing key states found in Redis or Redis not configured."
             )
 
-    async def get_usable_key(self) -> str:
+    async def get_usable_key(self, model_name: str | None = None) -> str:
         """
-        Finds a usable key based on both cooldown status and available requests in the 24h window.
+        Finds a usable key based on cooldown status, available requests in the 24h window,
+        and per-minute limits for specific models.
         Keys are sorted by:
         1. Not in cooldown
         2. Most available requests in 24h window
@@ -470,6 +474,16 @@ class KeyManager:
                 # Check cooldown status
                 is_limited = await key_info.is_rate_limited(self.redis_client)
                 if not is_limited:
+                    # Check per-minute limit for specific models
+                    if (
+                        model_name == "google/gemini-2.5-pro-exp-03-25"
+                        and now - key_info.last_used_time < 60
+                    ):
+                        logger.debug(
+                            f"Key ...{key_info.key[-4:]} used recently for {model_name}, skipping."
+                        )
+                        continue  # Skip this key, it was used within the last minute
+
                     # Check available requests
                     available = key_info.get_available_requests(self.settings.rpd_limit)
                     if available > 1:  # Keep at least 1 request as buffer
@@ -483,15 +497,15 @@ class KeyManager:
             if selected_key_info:
                 await selected_key_info.record_usage(self.redis_client)
                 logger.debug(
-                    f"Selected key ...{selected_key_info.key[-4:]} (total: {selected_key_info.total_requests}, "
+                    f"Selected key ...{selected_key_info.key[-4:]} for model {model_name} (total: {selected_key_info.total_requests}, "
                     f"available: {selected_key_info.get_available_requests(self.settings.rpd_limit)}, "
                     f"last used: {time.ctime(selected_key_info.last_used_time)})"
                 )
                 return selected_key_info.key
 
-            # All keys are either rate-limited or have insufficient available requests
+            # All keys are either rate-limited, have insufficient available requests, or were used recently for this model
             logger.warning(
-                f"All {len(valid_keys)} enabled keys are currently unavailable (cooldown or insufficient requests). "
+                f"All {len(valid_keys)} enabled keys are currently unavailable (cooldown, insufficient requests, or recently used for {model_name}). "
                 f"Waiting {self.settings.retry_delay_seconds}s..."
             )
             await asyncio.sleep(self.settings.retry_delay_seconds)
@@ -956,6 +970,149 @@ async def proxy_openrouter(request: Request, path: str):
     client_key = None
     client_auth_header = request.headers.get("authorization")
 
+    # --- Parallel streaming helper for Gemini ---
+    async def parallel_streaming_proxy(request, target_url, body, max_parallel=3):
+        """
+        Launches up to max_parallel streaming requests in parallel, each with a different available key.
+        Keeps retrying with new sets of keys until one succeeds.
+        """
+        retry_delay = 1.0  # seconds between retries if all fail
+        attempt = 0
+        while True:
+            attempt += 1
+            logger.info(
+                f"[Gemini Parallel Proxy] Attempt {attempt}: launching up to {max_parallel} parallel requests."
+            )
+            # Gather up to max_parallel available keys (not rate-limited, enabled)
+            usable_keys = []
+            checked_keys = set()
+            for _ in range(max_parallel * 2):  # Try a bit more in case of cooldowns
+                try:
+                    k = await key_manager.get_usable_key()
+                    if k not in checked_keys:
+                        usable_keys.append(k)
+                        checked_keys.add(k)
+                    if len(usable_keys) >= max_parallel:
+                        break
+                except Exception:
+                    break
+            if not usable_keys:
+                logger.warning(
+                    "[Gemini Parallel Proxy] No usable API keys found, waiting before retrying..."
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            # For each key, launch a streaming request coroutine
+            tasks = []
+            results = [None] * len(usable_keys)
+            done_event = asyncio.Event()
+
+            async def stream_attempt(idx, api_key):
+                try:
+                    headers = dict(request.headers)
+                    headers.pop("host", None)
+                    headers = {
+                        k: v for k, v in headers.items() if k.lower() != "authorization"
+                    }
+                    headers.update(
+                        {
+                            "Authorization": f"Bearer {api_key}",
+                            "HTTP-Referer": "http://localhost",
+                            "Host": "openrouter.ai",
+                        }
+                    )
+                    headers.pop("Content-Length", None)
+                    headers.pop("Transfer-Encoding", None)
+                    headers.pop("Connection", None)
+                    retry_error_prefixes_bytes = [
+                        prefix.encode() for prefix in settings.retry_error_prefixes
+                    ]
+                    req = http_client.build_request(
+                        method=request.method,
+                        url=target_url,
+                        headers=headers,
+                        content=body,
+                    )
+                    response = await http_client.send(req, stream=True)
+                    if response.status_code != 200:
+                        await response.aclose()
+                        results[idx] = (False, None, None)
+                        return
+
+                    # Buffer for error prefix detection
+                    buffer_size = settings.retry_buffer_size
+                    buffer = b""
+                    response_iter = response.aiter_bytes()
+                    try:
+                        for _ in range(buffer_size):
+                            try:
+                                chunk = await anext(response_iter)
+                                buffer += chunk
+                                for prefix_bytes in retry_error_prefixes_bytes:
+                                    if prefix_bytes in buffer:
+                                        await response.aclose()
+                                        results[idx] = (False, None, None)
+                                        return
+                            except StopAsyncIteration:
+                                break
+                    except Exception:
+                        await response.aclose()
+                        results[idx] = (False, None, None)
+                        return
+
+                    # If we get here, this stream is a candidate
+                    if not done_event.is_set():
+                        done_event.set()
+                        # Prepare StreamingResponse
+                        response_headers = dict(response.headers)
+
+                        async def merged_stream():
+                            if buffer:
+                                yield buffer
+                            async for chunk in response_iter:
+                                yield chunk
+                            await response.aclose()
+
+                        results[idx] = (
+                            True,
+                            StreamingResponse(
+                                merged_stream(),
+                                status_code=response.status_code,
+                                headers=response_headers,
+                                media_type=response.headers.get("content-type"),
+                            ),
+                            response,
+                        )
+                    else:
+                        await response.aclose()
+                        results[idx] = (False, None, None)
+                except Exception:
+                    results[idx] = (False, None, None)
+
+            # Launch all attempts
+            for i, k in enumerate(usable_keys):
+                tasks.append(asyncio.create_task(stream_attempt(i, k)))
+            # Wait for first to succeed, or all to finish
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Check if any succeeded
+            found_success = False
+            for r in results:
+                if r is None:
+                    continue
+                ok, resp, _ = r
+                if ok and resp is not None:
+                    # Cancel all unfinished tasks (except the winner)
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    return resp
+            # If none succeeded, wait and retry
+            logger.warning(
+                "[Gemini Parallel Proxy] All parallel attempts failed, retrying with new keys after delay..."
+            )
+            await asyncio.sleep(retry_delay)
+
     # Determine model type and key strategy only for chat completions
     if path == "chat/completions":
         try:
@@ -1032,6 +1189,10 @@ async def proxy_openrouter(request: Request, path: str):
     logger.debug(f"Target URL: {target_url}")
 
     # --- Request Forwarding ---
+    # Special case: Gemini parallel streaming
+    if use_proxy_keys and model_name == "google/gemini-2.5-pro-exp-03-25":
+        return await parallel_streaming_proxy(request, target_url, body, max_parallel=3)
+
     if use_proxy_keys:
         # Free model or non-chat path: Use key manager and retry logic
         max_retries = settings.max_retries_on_prefix
