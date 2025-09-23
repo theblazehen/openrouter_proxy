@@ -9,30 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict
 import os
 import logging
-import re
-import functools
 
-# --- Logging Setup ---
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "debug").upper()
-LOG_LEVEL_MAP = {
-    "DEBUG": logging.DEBUG,
-    "INFO": logging.INFO,
-    "WARNING": logging.WARNING,
-    "ERROR": logging.ERROR,
-    "CRITICAL": logging.CRITICAL,
-}
-LOGGING_LEVEL = LOG_LEVEL_MAP.get(LOG_LEVEL, logging.INFO)
-
-logging.basicConfig(
-    level=LOGGING_LEVEL,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("proxy.log")],
-)
-logger = logging.getLogger(__name__)
-
-
-import time
-from typing import Optional
 
 # In-memory async-aware cache for model free status
 _model_free_cache = {}
@@ -232,46 +209,6 @@ RPD_COOLDOWN_HOURS = settings.rpd_cooldown_hours
 
 
 # Function to parse API keys from environment variable
-def load_api_keys_from_env() -> List[APIKey]:
-    """
-    Parses API keys from the OR_API_KEYS environment variable.
-    Format: name1:key1,name2:key2,name3:key3
-    """
-    api_keys = []
-    env_keys = os.environ.get("OR_API_KEYS", "")
-
-    if not env_keys:
-        logger.warning(
-            "OR_API_KEYS environment variable not set or empty. No API keys loaded."
-        )
-        return api_keys
-
-    try:
-        key_pairs = env_keys.split(",")
-        for pair in key_pairs:
-            if ":" not in pair:
-                logger.warning(
-                    f"Invalid key format (missing name): {pair}. Expected format: name:key"
-                )
-                continue
-
-            name, key = pair.split(":", 1)  # Split on first colon only
-            name = name.strip()
-            key = key.strip()
-
-            if not key:
-                logger.warning(f"Empty API key for name: {name}")
-                continue
-
-            api_keys.append(APIKey(key=key, name=name))
-            # Log only the last 4 characters of the key for security
-            logger.info(
-                f"Loaded API key: {name} (ending in ...{key[-4:] if len(key) >= 4 else 'XXXX'})"
-            )
-    except Exception as e:
-        logger.error(f"Error parsing OR_API_KEYS environment variable: {e}")
-
-    return api_keys
 
 
 # --- Key Management ---
@@ -295,7 +232,7 @@ class KeyInfo:
         now = time.time()
         window_start = now - 86400  # 24 hours ago
         used_requests = self.get_requests_in_window(window_start, now)
-        return max(1, rpd_limit - used_requests)  # Always leave at least 1 available
+        return max(0, rpd_limit - used_requests)
 
     def prune_old_timestamps(self, older_than: float):
         """Remove timestamps older than the specified time."""
@@ -392,24 +329,22 @@ class KeyManager:
                 key_data = await self.redis_client.hgetall(f"keyinfo:{key_str}")
                 if key_data:
                     async with key_info.lock:
-                        key_info.enabled = key_data.get(b"enabled", b"1") == b"1"
+                        key_info.enabled = key_data.get("enabled", "1") == "1"
                         key_info.total_requests = int(
-                            key_data.get(b"total_requests", b"0")
+                            key_data.get("total_requests", "0")
                         )
                         key_info.rate_limited_until = float(
-                            key_data.get(b"rate_limited_until", b"0.0")
+                            key_data.get("rate_limited_until", "0.0")
                         )
                         key_info.last_used_time = float(
-                            key_data.get(b"last_used_time", b"0.0")
+                            key_data.get("last_used_time", "0.0")
                         )
 
                         # Load timestamps
-                        timestamps_str = key_data.get(b"timestamps", b"")
+                        timestamps_str = key_data.get("timestamps", "")
                         if timestamps_str:
                             key_info.timestamps = [
-                                float(ts)
-                                for ts in timestamps_str.decode().split(",")
-                                if ts
+                                float(ts) for ts in timestamps_str.split(",") if ts
                             ]
                             # Prune old timestamps on load
                             key_info.prune_old_timestamps(time.time() - 86400)
@@ -551,7 +486,6 @@ class KeyManager:
 
 
 # --- Globals ---
-# --- Globals ---
 app = FastAPI(title="OpenRouter Reverse Proxy")
 
 # Initialize Redis client if URL is provided
@@ -649,23 +583,23 @@ async def _forward_request(
 
             # Read up to buffer_size bytes (or less if the response is smaller)
             try:
-                for _ in range(buffer_size):
+                while len(buffer) < buffer_size:
                     try:
                         chunk = await anext(response_iter)
-                        buffer += chunk
-
-                        # Check if buffer contains any error prefix (might have newlines before the error)
-                        for prefix_bytes in retry_error_prefixes_bytes:
-                            if prefix_bytes in buffer:
-                                logger.warning(
-                                    f"Detected error prefix in stream with 200 OK: {prefix_bytes.decode(errors='ignore')}"
-                                )
-                                raise RetryWithErrorPrefixException(
-                                    prefix_bytes.decode(errors="ignore")
-                                )
                     except StopAsyncIteration:
                         # End of response reached before buffer filled
                         break
+                    buffer += chunk
+
+                    # Check if buffer contains any error prefix (might have newlines before the error)
+                    for prefix_bytes in retry_error_prefixes_bytes:
+                        if prefix_bytes in buffer:
+                            logger.warning(
+                                f"Detected error prefix in stream with 200 OK: {prefix_bytes.decode(errors='ignore')}"
+                            )
+                            raise RetryWithErrorPrefixException(
+                                prefix_bytes.decode(errors="ignore")
+                            )
             except RetryWithErrorPrefixException:
                 # Let this propagate up to the calling function
                 raise
