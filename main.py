@@ -431,7 +431,7 @@ class KeyManager:
                 "No existing key states found in Redis or Redis not configured."
             )
 
-    async def get_usable_key(self) -> str:
+    async def get_usable_key(self, should_count: bool = True, path: str = None) -> str:
         """
         Finds a usable key based on both cooldown status and available requests in the 24h window.
         Keys are sorted by:
@@ -481,12 +481,17 @@ class KeyManager:
                         )
 
             if selected_key_info:
-                await selected_key_info.record_usage(self.redis_client)
-                logger.debug(
-                    f"Selected key ...{selected_key_info.key[-4:]} (total: {selected_key_info.total_requests}, "
-                    f"available: {selected_key_info.get_available_requests(self.settings.rpd_limit)}, "
-                    f"last used: {time.ctime(selected_key_info.last_used_time)})"
-                )
+                if should_count:
+                    await selected_key_info.record_usage(self.redis_client)
+                    logger.debug(
+                        f"Incrementing counter for path '{path}': Selected key ...{selected_key_info.key[-4:]} (total: {selected_key_info.total_requests}, "
+                        f"available: {selected_key_info.get_available_requests(self.settings.rpd_limit)}, "
+                        f"last used: {time.ctime(selected_key_info.last_used_time)})"
+                    )
+                else:
+                    logger.debug(
+                        f"Skipping counter increment for non-countable path '{path}': Selected key ...{selected_key_info.key[-4:]}"
+                    )
                 return selected_key_info.key
 
             # All keys are either rate-limited or have insufficient available requests
@@ -1038,12 +1043,21 @@ async def proxy_openrouter(request: Request, path: str):
         retry_count = 0
         retry_delay = settings.retry_on_prefix_delay_seconds
 
+        # Define countable paths (those that should increment the counter)
+        countable_paths = {"chat/completions", "completions", "embeddings"}
+        should_count = path in countable_paths
+        logger.debug(
+            f"Path '{path}' is {'countable' if should_count else 'non-countable'} - will {'increment' if should_count else 'skip'} counter"
+        )
+
         while True:
             selected_key = None  # Ensure selected_key is defined in this scope
             try:
                 # Get a key that is enabled and not in cooldown
-                selected_key = await key_manager.get_usable_key()
-                # Usage is recorded within get_usable_key now
+                selected_key = await key_manager.get_usable_key(
+                    should_count=should_count, path=path
+                )
+                # Usage is recorded within get_usable_key now (conditionally)
 
                 key_suffix = (
                     f"...{selected_key[-4:]}"
