@@ -531,6 +531,8 @@ async def _forward_request(
     headers.pop("Content-Length", None)
     headers.pop("Transfer-Encoding", None)
     headers.pop("Connection", None)
+    # Avoid upstream compression; control client compression via GZipMiddleware
+    headers["Accept-Encoding"] = "identity"
 
     # Log headers without sensitive information
     # Log all outgoing headers, including Authorization, for debugging paid model issues
@@ -606,8 +608,27 @@ async def _forward_request(
                 # Let this propagate up to the calling function
                 raise
 
-        # Store headers before streaming starts
+        # Store and sanitize headers before streaming starts
         response_headers = dict(response.headers)
+        upstream_ce = response_headers.get("content-encoding")
+        upstream_cl = response_headers.get("content-length")
+        strip_headers = {
+            "content-encoding",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "upgrade",
+        }
+        sanitized_headers = {
+            k: v for k, v in response_headers.items() if k.lower() not in strip_headers
+        }
+        logger.debug(
+            f"Upstream Content-Encoding={upstream_ce}, Content-Length={upstream_cl}; stripping hop-by-hop/encoding headers."
+        )
 
         # Create an async generator to check for RPD limit while streaming
         async def check_rpd_stream():
@@ -653,7 +674,7 @@ async def _forward_request(
         return StreamingResponse(
             check_rpd_stream(),
             status_code=response.status_code,
-            headers=response_headers,
+            headers=sanitized_headers,
             media_type=response.headers.get("content-type"),
         )
 
@@ -724,10 +745,31 @@ async def _forward_request(
             logger.error(f"Failed to decode error response: {decode_err}")
             error_content = b'{"error": "Failed to decode error response"}'
 
+        # Sanitize upstream error headers before sending to client
+        error_headers = dict(e.response.headers)
+        upstream_ce = error_headers.get("content-encoding")
+        upstream_cl = error_headers.get("content-length")
+        strip_headers = {
+            "content-encoding",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "upgrade",
+        }
+        sanitized_error_headers = {
+            k: v for k, v in error_headers.items() if k.lower() not in strip_headers
+        }
+        logger.debug(
+            f"Upstream Error Content-Encoding={upstream_ce}, Content-Length={upstream_cl}; stripping headers for client error response."
+        )
         return StreamingResponse(
             iter([error_content]),
             status_code=e.response.status_code,
-            headers=dict(e.response.headers),
+            headers=sanitized_error_headers,
             media_type=e.response.headers.get(
                 "content-type", "application/json"
             ),  # Default media type
