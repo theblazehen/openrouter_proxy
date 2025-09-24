@@ -2,6 +2,7 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.gzip import GZipMiddleware
 import asyncio
 import time
 import json
@@ -487,6 +488,7 @@ class KeyManager:
 
 # --- Globals ---
 app = FastAPI(title="OpenRouter Reverse Proxy")
+app.add_middleware(GZipMiddleware, minimum_size=1)
 
 # Initialize Redis client if URL is provided
 redis_client = None
